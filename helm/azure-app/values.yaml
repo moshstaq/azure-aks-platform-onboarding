@@ -1,0 +1,54 @@
+replicaCount: 2
+
+image:
+  repository: acraksplatform.azurecr.io/azure-app
+  tag: "v1.0.0"
+  pullPolicy: IfNotPresent
+
+app:
+  environment: dev
+  region: eastus2
+
+serviceAccount:
+  name: azure-app-sa
+  clientId: ""
+  tenantId: ""
+
+keyVault:
+  secretName: db-password
+  vaultName: ""
+
+ingress:
+  enabled: true
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+  host: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+livenessProbe:
+  path: /health
+  initialDelaySeconds: 10
+  periodSeconds: 15
+
+readinessProbe:
+  path: /health
+  initialDelaySeconds: 5
+  periodSeconds: 10

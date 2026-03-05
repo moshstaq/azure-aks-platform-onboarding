@@ -1,0 +1,6 @@
+apiVersion: v2
+name: azure-app
+description: Sample workload onboarded onto the Azure AKS landing zone
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
