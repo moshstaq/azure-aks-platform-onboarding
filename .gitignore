@@ -1,0 +1,17 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+.terraform.lock.hcl
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Docker
+*.tar
