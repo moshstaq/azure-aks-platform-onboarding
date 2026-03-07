@@ -3,6 +3,14 @@ name: CI/CD — Build, Scan, Push, Deploy
 on:
   push:
     branches: [main]
+    paths:
+      - "app/**"
+      - "helm/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "helm/**"
   workflow_dispatch:
 
 permissions:
