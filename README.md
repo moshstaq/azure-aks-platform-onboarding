@@ -230,6 +230,55 @@ This project consumes outputs from the [azure-landing-zone](https://github.com/m
 
 ---
 
+## CI/CD Pipeline
+
+The GitHub Actions pipeline automates the full delivery path on every push to main that modifies app/ or helm/ files.
+
+### Pipeline Jobs
+
+**Job 1 — Build, Scan and Push**
+
+- Builds Docker image using multi-stage build
+- Scans image with Trivy — pipeline blocks on CRITICAL CVEs
+- Pushes to ACR via OIDC — no stored credentials
+
+**Job 2 — Deploy to AKS**
+
+- Reads all identity values dynamically from Azure CLI at runtime
+- Assigns AcrPull to kubelet identity (idempotent)
+- Creates federated credentials for workload identity and AGIC (idempotent)
+- Installs CSI Secrets Store driver (idempotent)
+- Installs AGIC with current identity values (idempotent)
+- Ensures db-password exists in Key Vault (idempotent)
+- Helm install or upgrade with current image tag
+
+**Job 3 — Validate Endpoints**
+
+- Retrieves App Gateway public IP
+- Waits for AGIC reconciliation
+- Validates all three endpoints return expected responses
+
+### Authentication
+
+The pipeline authenticates to Azure using OIDC federated credentials. No secrets are stored in GitHub. The service principal has a federated credential scoped to the main branch of this repo.
+
+### Pipeline Trigger
+
+Triggers on push or pull request to main when app/ or helm/ files change. Documentation and infrastructure changes do not trigger a deployment. Manual dispatch available via GitHub Actions UI.
+
+### GitHub Secrets Required
+
+| Secret                | Purpose                                        |
+| --------------------- | ---------------------------------------------- |
+| AZURE_CLIENT_ID       | GitHub Actions service principal               |
+| AZURE_TENANT_ID       | Azure AD tenant                                |
+| AZURE_SUBSCRIPTION_ID | Azure subscription                             |
+| AZURE_ACR_ID          | Full ACR resource ID for role assignment scope |
+
+### Identity Drift Handling
+
+Managed identity client IDs change every time AKS is destroyed and reprovisioned. The pipeline reads all identity values dynamically from Azure CLI at runtime so it is safe to run after any redeploy without manual intervention.
+
 ## Related
 
 [azure-landing-zone](https://github.com/moshstaq/azure-landing-zone) — the platform this project deploys onto.
