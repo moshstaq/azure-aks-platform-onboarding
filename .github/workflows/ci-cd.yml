@@ -1,0 +1,344 @@
+name: CI/CD — Build, Scan, Push, Deploy
+
+on:
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+permissions:
+    id-token: write
+    contents: read
+
+env:
+    ACR_NAME: acraksplatform
+    IMAGE_NAME: azure-app
+    IMAGE_TAG: ${{ github.sha }}
+    AKS_CLUSTER: aks-app-dev
+    AKS_RG: rg-app-dev
+    KEY_VAULT: kv-aks-appdev
+    HELM_RELEASE: azure-app
+    HELM_CHART: helm/azure-app
+    TENANT_ID: 5be5dc5e-baf8-4a95-998d-1bd76c3aa0eb
+
+jobs:
+    # ──────────────────────────────────────────────────────────────────────
+    # JOB 1 — Build, scan and push image to ACR
+    # ──────────────────────────────────────────────────────────────────────
+    build-and-push:
+        name: Build, Scan and Push
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Azure login (OIDC)
+              uses: azure/login@v2
+              with:
+                  client-id: ${{ secrets.AZURE_CLIENT_ID }}
+                  tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+                  subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+            - name: Login to ACR
+              run: az acr login --name ${{ env.ACR_NAME }}
+
+            - name: Build Docker image
+              run: |
+                  docker build \
+                    -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+                    -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest \
+                    app/
+
+            - name: Scan image with Trivy
+              uses: aquasecurity/trivy-action@master
+              with:
+                  image-ref: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+                  format: table
+                  exit-code: 0
+                  severity: CRITICAL,HIGH
+                  ignore-unfixed: true
+
+            - name: Push image to ACR
+              run: |
+                  docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+                  docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
+
+    # ──────────────────────────────────────────────────────────────────────
+    # JOB 2 — Read Terraform outputs dynamically
+    # ──────────────────────────────────────────────────────────────────────
+    get-infra-values:
+        name: Get Infrastructure Values
+        runs-on: ubuntu-latest
+        outputs:
+            workload_client_id: ${{ steps.tf-outputs.outputs.workload_client_id }}
+            agic_client_id: ${{ steps.tf-outputs.outputs.agic_client_id }}
+            kubelet_object_id: ${{ steps.tf-outputs.outputs.kubelet_object_id }}
+            appgw_id: ${{ steps.tf-outputs.outputs.appgw_id }}
+            oidc_issuer: ${{ steps.tf-outputs.outputs.oidc_issuer }}
+            acr_id: ${{ steps.tf-outputs.outputs.acr_id }}
+
+        steps:
+            - name: Azure login (OIDC)
+              uses: azure/login@v2
+              with:
+                  client-id: ${{ secrets.AZURE_CLIENT_ID }}
+                  tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+                  subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+            - name: Read AKS values
+              id: tf-outputs
+              run: |
+                  WORKLOAD_CLIENT_ID=$(az identity show \
+                    --name mi-aks-nginx-demo \
+                    --resource-group rg-app-dev \
+                    --query clientId -o tsv)
+
+                  AGIC_CLIENT_ID=$(az identity show \
+                    --name mi-agic \
+                    --resource-group rg-app-dev \
+                    --query clientId -o tsv)
+
+                  KUBELET_OBJECT_ID=$(az aks show \
+                    --name ${{ env.AKS_CLUSTER }} \
+                    --resource-group ${{ env.AKS_RG }} \
+                    --query identityProfile.kubeletidentity.objectId -o tsv)
+
+                  APPGW_ID=$(az network application-gateway show \
+                    --name agw-hub \
+                    --resource-group rg-platform-connectivity \
+                    --query id -o tsv)
+
+                  OIDC_ISSUER=$(az aks show \
+                    --name ${{ env.AKS_CLUSTER }} \
+                    --resource-group ${{ env.AKS_RG }} \
+                    --query oidcIssuerProfile.issuerUrl -o tsv)
+
+                  ACR_ID=$(az acr show \
+                    --name ${{ env.ACR_NAME }} \
+                    --query id -o tsv)
+
+                  echo "workload_client_id=$WORKLOAD_CLIENT_ID" >> $GITHUB_OUTPUT
+                  echo "agic_client_id=$AGIC_CLIENT_ID" >> $GITHUB_OUTPUT
+                  echo "kubelet_object_id=$KUBELET_OBJECT_ID" >> $GITHUB_OUTPUT
+                  echo "appgw_id=$APPGW_ID" >> $GITHUB_OUTPUT
+                  echo "oidc_issuer=$OIDC_ISSUER" >> $GITHUB_OUTPUT
+                  echo "acr_id=$ACR_ID" >> $GITHUB_OUTPUT
+
+    # ──────────────────────────────────────────────────────────────────────
+    # JOB 3 — Deploy to AKS
+    # ──────────────────────────────────────────────────────────────────────
+    deploy:
+        name: Deploy to AKS
+        runs-on: ubuntu-latest
+        needs: [build-and-push, get-infra-values]
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Azure login (OIDC)
+              uses: azure/login@v2
+              with:
+                  client-id: ${{ secrets.AZURE_CLIENT_ID }}
+                  tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+                  subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+            - name: Get AKS credentials
+              run: |
+                  az aks get-credentials \
+                    --resource-group ${{ env.AKS_RG }} \
+                    --name ${{ env.AKS_CLUSTER }} \
+                    --overwrite-existing
+
+            - name: Assign AcrPull to kubelet identity
+              run: |
+                  EXISTING=$(az role assignment list \
+                    --assignee ${{ needs.get-infra-values.outputs.kubelet_object_id }} \
+                    --role AcrPull \
+                    --scope ${{ needs.get-infra-values.outputs.acr_id }} \
+                    --query "[].id" -o tsv)
+
+                  if [ -z "$EXISTING" ]; then
+                    az role assignment create \
+                      --assignee ${{ needs.get-infra-values.outputs.kubelet_object_id }} \
+                      --role AcrPull \
+                      --scope ${{ needs.get-infra-values.outputs.acr_id }}
+                    echo "AcrPull assigned"
+                  else
+                    echo "AcrPull already assigned - skipping"
+                  fi
+
+            - name: Create federated credential for azure-app-sa
+              run: |
+                  EXISTING=$(az identity federated-credential list \
+                    --identity-name mi-aks-nginx-demo \
+                    --resource-group rg-app-dev \
+                    --query "[?name=='fed-azure-app'].name" -o tsv)
+
+                  if [ -z "$EXISTING" ]; then
+                    az identity federated-credential create \
+                      --name fed-azure-app \
+                      --identity-name mi-aks-nginx-demo \
+                      --resource-group rg-app-dev \
+                      --issuer ${{ needs.get-infra-values.outputs.oidc_issuer }} \
+                      --subject "system:serviceaccount:default:azure-app-sa" \
+                      --audience "api://AzureADTokenExchange"
+                    echo "Federated credential created"
+                  else
+                    echo "Federated credential exists - skipping"
+                  fi
+
+            - name: Create federated credential for AGIC
+              run: |
+                  EXISTING=$(az identity federated-credential list \
+                    --identity-name mi-agic \
+                    --resource-group rg-app-dev \
+                    --query "[?name=='fed-agic'].name" -o tsv)
+
+                  if [ -z "$EXISTING" ]; then
+                    az identity federated-credential create \
+                      --name fed-agic \
+                      --identity-name mi-agic \
+                      --resource-group rg-app-dev \
+                      --issuer ${{ needs.get-infra-values.outputs.oidc_issuer }} \
+                      --subject "system:serviceaccount:kube-system:ingress-azure" \
+                      --audience "api://AzureADTokenExchange"
+                    echo "AGIC federated credential created"
+                  else
+                    echo "AGIC federated credential exists - skipping"
+                  fi
+
+            - name: Install CSI Secrets Store driver
+              run: |
+                  helm repo add csi-secrets-store-provider-azure \
+                    https://azure.github.io/secrets-store-csi-driver-provider-azure/charts
+                  helm repo update
+
+                  if ! helm status csi-secrets-store -n kube-system &>/dev/null; then
+                    helm install csi-secrets-store \
+                      csi-secrets-store-provider-azure/csi-secrets-store-provider-azure \
+                      --namespace kube-system \
+                      --set syncSecret.enabled=true \
+                      --set "secrets-store-csi-driver.syncSecret.enabled=true"
+                    echo "CSI driver installed"
+                  else
+                    echo "CSI driver already installed - skipping"
+                  fi
+
+            - name: Grant CSI driver secret sync RBAC
+              run: |
+                  EXISTING=$(kubectl get clusterrolebinding secrets-store-syncsecret \
+                    --ignore-not-found -o name)
+
+                  if [ -z "$EXISTING" ]; then
+                    kubectl create clusterrolebinding secrets-store-syncsecret \
+                      --clusterrole=cluster-admin \
+                      --serviceaccount=kube-system:secrets-store-csi-driver
+                    echo "RBAC created"
+                  else
+                    echo "RBAC already exists - skipping"
+                  fi
+
+            - name: Install AGIC
+              run: |
+                  if ! helm status ingress-azure -n kube-system &>/dev/null; then
+                    helm install ingress-azure \
+                      oci://mcr.microsoft.com/azure-application-gateway/charts/ingress-azure \
+                      --namespace kube-system \
+                      --set appgw.applicationGatewayID=${{ needs.get-infra-values.outputs.appgw_id }} \
+                      --set armAuth.type=workloadIdentity \
+                      --set armAuth.identityClientID=${{ needs.get-infra-values.outputs.agic_client_id }} \
+                      --set rbac.enabled=true
+                    echo "AGIC installed"
+                  else
+                    echo "AGIC already installed - skipping"
+                  fi
+
+            - name: Add db-password to Key Vault
+              run: |
+                  EXISTING=$(az keyvault secret list \
+                    --vault-name ${{ env.KEY_VAULT }} \
+                    --query "[?name=='db-password'].name" -o tsv)
+
+                  if [ -z "$EXISTING" ]; then
+                    az keyvault secret set \
+                      --vault-name ${{ env.KEY_VAULT }} \
+                      --name db-password \
+                      --value 'SuperSecretPassword123'
+                    echo "Secret created"
+                  else
+                    echo "Secret already exists - skipping"
+                  fi
+
+            - name: Deploy Helm chart
+              run: |
+                  if helm status ${{ env.HELM_RELEASE }} -n default &>/dev/null; then
+                    helm upgrade ${{ env.HELM_RELEASE }} ${{ env.HELM_CHART }} \
+                      --namespace default \
+                      --set image.tag=${{ env.IMAGE_TAG }} \
+                      --set serviceAccount.clientId=${{ needs.get-infra-values.outputs.workload_client_id }} \
+                      --set serviceAccount.tenantId=${{ env.TENANT_ID }} \
+                      --set keyVault.vaultName=${{ env.KEY_VAULT }}
+                    echo "Helm upgraded"
+                  else
+                    helm install ${{ env.HELM_RELEASE }} ${{ env.HELM_CHART }} \
+                      --namespace default \
+                      --set image.tag=${{ env.IMAGE_TAG }} \
+                      --set serviceAccount.clientId=${{ needs.get-infra-values.outputs.workload_client_id }} \
+                      --set serviceAccount.tenantId=${{ env.TENANT_ID }} \
+                      --set keyVault.vaultName=${{ env.KEY_VAULT }}
+                    echo "Helm installed"
+                  fi
+
+            - name: Wait for pods to be ready
+              run: |
+                  kubectl rollout status deployment/${{ env.HELM_RELEASE }} \
+                    --namespace default \
+                    --timeout=300s
+
+    # ──────────────────────────────────────────────────────────────────────
+    # JOB 4 — Validate endpoints
+    # ──────────────────────────────────────────────────────────────────────
+    validate:
+        name: Validate Endpoints
+        runs-on: ubuntu-latest
+        needs: deploy
+
+        steps:
+            - name: Azure login (OIDC)
+              uses: azure/login@v2
+              with:
+                  client-id: ${{ secrets.AZURE_CLIENT_ID }}
+                  tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+                  subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+            - name: Get App Gateway IP
+              id: appgw-ip
+              run: |
+                  IP=$(az network public-ip show \
+                    --name pip-appgw \
+                    --resource-group rg-platform-connectivity \
+                    --query ipAddress -o tsv)
+                  echo "ip=$IP" >> $GITHUB_OUTPUT
+                  echo "App Gateway IP: $IP"
+
+            - name: Wait for AGIC reconciliation
+              run: sleep 60
+
+            - name: Validate /health
+              run: |
+                  RESPONSE=$(curl -sf http://${{ steps.appgw-ip.outputs.ip }}/health)
+                  echo "Response: $RESPONSE"
+                  echo $RESPONSE | grep -q "healthy"
+
+            - name: Validate /info
+              run: |
+                  RESPONSE=$(curl -sf http://${{ steps.appgw-ip.outputs.ip }}/info)
+                  echo "Response: $RESPONSE"
+                  echo $RESPONSE | grep -q "azure-aks-platform-onboarding"
+
+            - name: Validate /secret-check
+              run: |
+                  RESPONSE=$(curl -sf http://${{ steps.appgw-ip.outputs.ip }}/secret-check)
+                  echo "Response: $RESPONSE"
+                  echo $RESPONSE | grep -q "true"
