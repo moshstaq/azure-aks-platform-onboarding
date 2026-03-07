@@ -11,7 +11,6 @@ permissions:
 
 env:
   ACR_NAME: acraksplatform
-  ACR_ID: /subscriptions/d277e2ff-ef0c-495f-92de-938e9c7fb6ff/resourceGroups/rg-app-dev/providers/Microsoft.ContainerRegistry/registries/acraksplatform
   IMAGE_NAME: azure-app
   IMAGE_TAG: ${{ github.sha }}
   AKS_CLUSTER: aks-app-dev
@@ -19,7 +18,6 @@ env:
   KEY_VAULT: kv-aks-appdev
   HELM_RELEASE: azure-app
   HELM_CHART: helm/azure-app
-  TENANT_ID: 5be5dc5e-baf8-4a95-998d-1bd76c3aa0eb
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────
@@ -91,7 +89,6 @@ jobs:
             --overwrite-existing
 
       - name: Read infrastructure values
-        id: infra
         run: |
           KUBELET_OID=$(az aks show \
             --name ${{ env.AKS_CLUSTER }} \
@@ -118,25 +115,26 @@ jobs:
             --resource-group rg-platform-connectivity \
             --query id -o tsv)
 
-          echo "kubelet_oid=$KUBELET_OID" >> $GITHUB_ENV
-          echo "workload_client_id=$WORKLOAD_CLIENT_ID" >> $GITHUB_ENV
-          echo "agic_client_id=$AGIC_CLIENT_ID" >> $GITHUB_ENV
-          echo "oidc_issuer=$OIDC_ISSUER" >> $GITHUB_ENV
-          echo "appgw_id=$APPGW_ID" >> $GITHUB_ENV
+          echo "KUBELET_OID=$KUBELET_OID" >> $GITHUB_ENV
+          echo "WORKLOAD_CLIENT_ID=$WORKLOAD_CLIENT_ID" >> $GITHUB_ENV
+          echo "AGIC_CLIENT_ID=$AGIC_CLIENT_ID" >> $GITHUB_ENV
+          echo "OIDC_ISSUER=$OIDC_ISSUER" >> $GITHUB_ENV
+          echo "APPGW_ID=$APPGW_ID" >> $GITHUB_ENV
 
       - name: Assign AcrPull to kubelet identity
         run: |
           EXISTING=$(az role assignment list \
-            --assignee ${{ env.kubelet_oid }} \
+            --assignee $KUBELET_OID \
             --role AcrPull \
-            --scope ${{ env.ACR_ID }} \
+            --scope ${{ secrets.AZURE_ACR_ID }} \
             --query "[].id" -o tsv)
 
           if [ -z "$EXISTING" ]; then
             az role assignment create \
-              --assignee ${{ env.kubelet_oid }} \
+              --assignee-object-id $KUBELET_OID \
+              --assignee-principal-type ServicePrincipal \
               --role AcrPull \
-              --scope ${{ env.ACR_ID }}
+              --scope ${{ secrets.AZURE_ACR_ID }}
             echo "AcrPull assigned"
           else
             echo "AcrPull already assigned - skipping"
@@ -154,7 +152,7 @@ jobs:
               --name fed-azure-app \
               --identity-name mi-aks-nginx-demo \
               --resource-group ${{ env.AKS_RG }} \
-              --issuer ${{ env.oidc_issuer }} \
+              --issuer $OIDC_ISSUER \
               --subject "system:serviceaccount:default:azure-app-sa" \
               --audience "api://AzureADTokenExchange"
             echo "Federated credential created"
@@ -174,7 +172,7 @@ jobs:
               --name fed-agic \
               --identity-name mi-agic \
               --resource-group ${{ env.AKS_RG }} \
-              --issuer ${{ env.oidc_issuer }} \
+              --issuer $OIDC_ISSUER \
               --subject "system:serviceaccount:kube-system:ingress-azure" \
               --audience "api://AzureADTokenExchange"
             echo "AGIC federated credential created"
@@ -219,9 +217,9 @@ jobs:
             helm install ingress-azure \
               oci://mcr.microsoft.com/azure-application-gateway/charts/ingress-azure \
               --namespace kube-system \
-              --set appgw.applicationGatewayID=${{ env.appgw_id }} \
+              --set appgw.applicationGatewayID=$APPGW_ID \
               --set armAuth.type=workloadIdentity \
-              --set armAuth.identityClientID=${{ env.agic_client_id }} \
+              --set armAuth.identityClientID=$AGIC_CLIENT_ID \
               --set rbac.enabled=true
             echo "AGIC installed"
           else
@@ -250,16 +248,16 @@ jobs:
             helm upgrade ${{ env.HELM_RELEASE }} ${{ env.HELM_CHART }} \
               --namespace default \
               --set image.tag=${{ env.IMAGE_TAG }} \
-              --set serviceAccount.clientId=${{ env.workload_client_id }} \
-              --set serviceAccount.tenantId=${{ env.TENANT_ID }} \
+              --set serviceAccount.clientId=$WORKLOAD_CLIENT_ID \
+              --set serviceAccount.tenantId=${{ secrets.AZURE_TENANT_ID }} \
               --set keyVault.vaultName=${{ env.KEY_VAULT }}
             echo "Helm upgraded"
           else
             helm install ${{ env.HELM_RELEASE }} ${{ env.HELM_CHART }} \
               --namespace default \
               --set image.tag=${{ env.IMAGE_TAG }} \
-              --set serviceAccount.clientId=${{ env.workload_client_id }} \
-              --set serviceAccount.tenantId=${{ env.TENANT_ID }} \
+              --set serviceAccount.clientId=$WORKLOAD_CLIENT_ID \
+              --set serviceAccount.tenantId=${{ secrets.AZURE_TENANT_ID }} \
               --set keyVault.vaultName=${{ env.KEY_VAULT }}
             echo "Helm installed"
           fi
